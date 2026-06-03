@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""clusage-waybar -- Claude Code usage indicator for Waybar.
+
+Reads the OAuth token Claude Code stores in ~/.claude/.credentials.json, calls
+the same usage endpoint the `/usage` panel uses (api.anthropic.com/api/oauth/usage),
+and prints a Waybar JSON object: {text, tooltip, class, percentage}.
+
+The bar text shows session (5h) and weekly (all-models) utilization. The tooltip
+adds the per-model weekly breakdown (Sonnet / Opus) and reset times.
+
+Successful responses are cached to ~/.cache/clusage/usage.json so a transient
+network/API failure shows the last known value (dimmed) instead of going blank.
+"""
+
+import json
+import os
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime
+
+CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+CACHE_DIR = os.path.expanduser("~/.cache/clusage")
+CACHE_PATH = os.path.join(CACHE_DIR, "usage.json")
+
+API_BASE = "https://api.anthropic.com"
+USAGE_URL = f"{API_BASE}/api/oauth/usage"
+TOKEN_URL = f"{API_BASE}/v1/oauth/token"
+# Public Claude Code OAuth client id (same one the CLI ships).
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+UA = "clusage-waybar/1.0"
+ICON = "\U000f06a9"  # nf-md-robot 󰚩
+
+
+def _http_json(req, timeout=8):
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def load_creds():
+    with open(CREDS_PATH) as f:
+        return json.load(f)
+
+
+def save_creds(data):
+    """Atomically write credentials back, preserving permissions (0600)."""
+    tmp = CREDS_PATH + ".clusage.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        finally:
+            raise
+    os.replace(tmp, CREDS_PATH)
+
+
+def refresh_token(creds):
+    """Refresh the access token in place and persist it. Returns new access token."""
+    oauth = creds["claudeAiOauth"]
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": oauth["refreshToken"],
+            "client_id": CLIENT_ID,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    tok = _http_json(req)
+    oauth["accessToken"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        oauth["refreshToken"] = tok["refresh_token"]
+    if tok.get("expires_in"):
+        oauth["expiresAt"] = int(time.time() * 1000) + int(tok["expires_in"]) * 1000
+    save_creds(creds)
+    return oauth["accessToken"]
+
+
+def get_access_token():
+    creds = load_creds()
+    oauth = creds["claudeAiOauth"]
+    expires_at = oauth.get("expiresAt", 0)
+    # Refresh if expired or within 60s of expiry.
+    if time.time() * 1000 >= expires_at - 60_000:
+        return refresh_token(creds)
+    return oauth["accessToken"]
+
+
+def fetch_usage(token, allow_refresh=True):
+    req = urllib.request.Request(
+        USAGE_URL,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    try:
+        return _http_json(req)
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and allow_refresh:
+            # Token rejected -> force a refresh and retry once.
+            creds = load_creds()
+            token = refresh_token(creds)
+            return fetch_usage(token, allow_refresh=False)
+        raise
+
+
+def write_cache(usage):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    payload = {"fetched_at": int(time.time()), "usage": usage}
+    tmp = CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, CACHE_PATH)
+
+
+def read_cache():
+    try:
+        with open(CACHE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def pct(block):
+    # The API returns utilization already as a percentage (e.g. 32.0 == 32%).
+    if not block:
+        return None
+    return block.get("utilization")
+
+
+def fmt_reset(block, weekly=False):
+    if not block or not block.get("resets_at"):
+        return ""
+    try:
+        dt = datetime.fromisoformat(block["resets_at"]).astimezone()
+    except Exception:
+        return ""
+    if weekly:
+        return dt.strftime("%a %H:%M")
+    return dt.strftime("%H:%M")
+
+
+def time_until(block):
+    """Compact countdown until this block resets, e.g. '2h18m', '47m', 'now'."""
+    if not block or not block.get("resets_at"):
+        return ""
+    try:
+        dt = datetime.fromisoformat(block["resets_at"]).astimezone()
+    except Exception:
+        return ""
+    secs = int(dt.timestamp() - time.time())
+    if secs <= 0:
+        return "now"
+    h, m = divmod(secs // 60, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+def severity_class(p):
+    if p is None:
+        return "unknown"
+    if p >= 90:
+        return "critical"
+    if p >= 75:
+        return "high"
+    if p >= 50:
+        return "medium"
+    return "low"
+
+
+def build_output(usage, fetched_at, stale=False):
+    five = usage.get("five_hour")
+    week = usage.get("seven_day")
+    sonnet = usage.get("seven_day_sonnet")
+    opus = usage.get("seven_day_opus")
+
+    sp = pct(five)
+    wp = pct(week)
+
+    def n(p):
+        return "--" if p is None else f"{p:.0f}%"
+
+    text = f"{ICON} {n(sp)}·{n(wp)}"
+    left = time_until(five)
+    if left:
+        text += f" \U000f0150 {left}"  # nf-md-timer-sand 󰅐-ish clock 󰥐
+
+    # Tooltip (pango markup).
+    lines = ["<b>Claude Code usage</b>", ""]
+    rows = [
+        ("Session (5h)", sp, fmt_reset(five)),
+        ("Weekly (all)", wp, fmt_reset(week, weekly=True)),
+    ]
+    sub = []
+    if sonnet is not None:
+        sub.append(("  Sonnet", pct(sonnet), fmt_reset(sonnet, weekly=True)))
+    if opus is not None:
+        sub.append(("  Opus", pct(opus), fmt_reset(opus, weekly=True)))
+    for label, p, reset in rows:
+        pp = "--" if p is None else f"{p:5.1f}%"
+        rs = f"  resets {reset}" if reset else ""
+        lines.append(f"{label:<14}{pp}{rs}")
+    if sub:
+        for label, p, reset in sub:
+            pp = "--" if p is None else f"{p:5.1f}%"
+            rs = f"  resets {reset}" if reset else ""
+            lines.append(f"<small>{label:<14}{pp}{rs}</small>")
+    extra = usage.get("extra_usage")
+    if extra and extra.get("is_enabled"):
+        used = extra.get("used_credits")
+        limit = extra.get("monthly_limit")
+        cur = extra.get("currency", "")
+        if used is not None and limit:
+            lines.append("")
+            lines.append(
+                f"<small>Overage      {used:.0f}/{limit:.0f} {cur} credits</small>"
+            )
+
+    lines.append("")
+    upd = time.strftime("%H:%M", time.localtime(fetched_at)) if fetched_at else "?"
+    suffix = "  (stale)" if stale else ""
+    lines.append(f"<small>updated {upd}{suffix}</small>")
+    tooltip = "\n".join(lines)
+
+    # Worst of session / weekly drives color + percentage.
+    worst = max([p for p in (sp, wp) if p is not None], default=None)
+    cls = severity_class(worst)
+    if stale:
+        cls = cls + " stale"
+    out = {"text": text, "tooltip": tooltip, "class": cls}
+    if worst is not None:
+        out["percentage"] = round(worst)
+    return out
+
+
+def main():
+    try:
+        token = get_access_token()
+        usage = fetch_usage(token)
+        write_cache(usage)
+        print(json.dumps(build_output(usage, int(time.time()))))
+        return
+    except Exception as e:
+        cached = read_cache()
+        if cached and cached.get("usage"):
+            out = build_output(cached["usage"], cached.get("fetched_at"), stale=True)
+            print(json.dumps(out))
+            return
+        # No data at all.
+        print(
+            json.dumps(
+                {
+                    "text": f"{ICON} --",
+                    "tooltip": f"Claude Code usage unavailable\n<small>{type(e).__name__}: {e}</small>",
+                    "class": "unknown error",
+                }
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()

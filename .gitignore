@@ -1,0 +1,4 @@
+# Runtime cache (lives in ~/.cache/clusage, never in the repo — but ignore stray copies)
+usage.json
+*.tmp
+__pycache__/
