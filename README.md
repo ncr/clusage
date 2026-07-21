@@ -3,10 +3,13 @@
 A Waybar module that shows your live Claude Code rate-limit utilization in the
 Omarchy top bar — the same numbers as the `/usage` panel.
 
-- **Bar text:** `󰚩 {session}%·{weekly}% 󰅐 {countdown}` — session (5h) and weekly
-  (all-models) utilization, plus time until the session window resets (e.g. `4h20m`).
-- **Tooltip (hover):** session + weekly with reset times, **Sonnet** (and Opus, if active)
-  weekly breakdown, and overage-credit usage.
+- **Bar text:** `󰚩 {session}%·{weekly}%·{F}{fable}% 󰅐 {countdown}` — session (5h) and
+  weekly (all-models) utilization, any **active per-model weekly cap** abbreviated by
+  initial (e.g. `F100%` for Fable at its weekly limit), plus time until the session
+  window resets (e.g. `4h20m`).
+- **Tooltip (hover):** session + weekly with reset times, the **per-model weekly caps**
+  (Fable, and Sonnet/Opus if the API still reports them) with `◀` marking the currently
+  binding one, and overage-credit usage.
 - Refreshes every 60s. Color shifts amber → red as utilization climbs; dims when stale.
 
 ## How it works
@@ -26,6 +29,10 @@ fails, the last value is shown dimmed (class `stale`) instead of going blank.
 - `utilization` is **already a percentage** (e.g. `32.0` == 32%), not a 0–1 fraction.
 - `resets_at` is an ISO-8601 string.
 - Blocks can be `null` (e.g. `seven_day_opus` when Opus is unused this week).
+- **Per-model weekly caps moved into `limits[]`**: the old `seven_day_<model>` fields
+  are now `null`; each model cap is a `weekly_scoped` entry carrying
+  `scope.model.display_name` (e.g. `Fable`), a `percent`, and `is_active` marking the
+  currently binding limit.
 
 ## Installed files
 

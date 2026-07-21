@@ -144,16 +144,43 @@ def pct(block):
     return block.get("utilization")
 
 
-def fmt_reset(block, weekly=False):
-    if not block or not block.get("resets_at"):
+def _fmt_iso(iso, weekly=False):
+    if not iso:
         return ""
     try:
-        dt = datetime.fromisoformat(block["resets_at"]).astimezone()
+        dt = datetime.fromisoformat(iso).astimezone()
     except Exception:
         return ""
-    if weekly:
-        return dt.strftime("%a %H:%M")
-    return dt.strftime("%H:%M")
+    return dt.strftime("%a %H:%M") if weekly else dt.strftime("%H:%M")
+
+
+def fmt_reset(block, weekly=False):
+    return _fmt_iso((block or {}).get("resets_at"), weekly)
+
+
+def model_limits(usage):
+    """Per-model weekly caps from the `limits` array (e.g. Fable).
+
+    The API moved model-scoped utilization out of the old seven_day_<model>
+    fields into `limits[]`, where each model cap carries scope.model.display_name.
+    Returns [{name, pct, resets_at, active}], highest utilization first.
+    """
+    out = []
+    for lim in usage.get("limits") or []:
+        model = (lim.get("scope") or {}).get("model") or {}
+        name = model.get("display_name")
+        if not name:
+            continue
+        out.append(
+            {
+                "name": name,
+                "pct": lim.get("percent"),
+                "resets_at": lim.get("resets_at"),
+                "active": bool(lim.get("is_active")),
+            }
+        )
+    out.sort(key=lambda m: (m["pct"] is None, -(m["pct"] or 0)))
+    return out
 
 
 def time_until(block):
@@ -190,6 +217,7 @@ def build_output(usage, fetched_at, stale=False):
     week = usage.get("seven_day")
     sonnet = usage.get("seven_day_sonnet")
     opus = usage.get("seven_day_opus")
+    models = model_limits(usage)
 
     sp = pct(five)
     wp = pct(week)
@@ -198,6 +226,10 @@ def build_output(usage, fetched_at, stale=False):
         return "--" if p is None else f"{p:.0f}%"
 
     text = f"{ICON} {n(sp)}·{n(wp)}"
+    # Surface active per-model caps (e.g. Fable) right in the bar, abbreviated.
+    for m in models:
+        if m["active"] and m["pct"] is not None:
+            text += f"·{m['name'][0]}{m['pct']:.0f}%"
     left = time_until(five)
     if left:
         text += f" \U000f0150 {left}"  # nf-md-timer-sand 󰅐-ish clock 󰥐
@@ -208,20 +240,25 @@ def build_output(usage, fetched_at, stale=False):
         ("Session (5h)", sp, fmt_reset(five)),
         ("Weekly (all)", wp, fmt_reset(week, weekly=True)),
     ]
-    sub = []
-    if sonnet is not None:
-        sub.append(("  Sonnet", pct(sonnet), fmt_reset(sonnet, weekly=True)))
-    if opus is not None:
-        sub.append(("  Opus", pct(opus), fmt_reset(opus, weekly=True)))
     for label, p, reset in rows:
         pp = "--" if p is None else f"{p:5.1f}%"
         rs = f"  resets {reset}" if reset else ""
         lines.append(f"{label:<14}{pp}{rs}")
-    if sub:
-        for label, p, reset in sub:
-            pp = "--" if p is None else f"{p:5.1f}%"
-            rs = f"  resets {reset}" if reset else ""
-            lines.append(f"<small>{label:<14}{pp}{rs}</small>")
+
+    # Per-model weekly caps (Fable, plus Sonnet/Opus if the API still sends them).
+    sub = []
+    seen = set()
+    for m in models:
+        sub.append((f"  {m['name']}", m["pct"], _fmt_iso(m["resets_at"], weekly=True), m["active"]))
+        seen.add(m["name"].lower())
+    for label, blk in (("Sonnet", sonnet), ("Opus", opus)):
+        if blk is not None and label.lower() not in seen:
+            sub.append((f"  {label}", pct(blk), fmt_reset(blk, weekly=True), False))
+    for label, p, reset, active in sub:
+        pp = "--" if p is None else f"{p:5.1f}%"
+        rs = f"  resets {reset}" if reset else ""
+        mark = "  ◀" if active else ""  # ◀ marks the currently binding cap
+        lines.append(f"<small>{label:<14}{pp}{rs}{mark}</small>")
     extra = usage.get("extra_usage")
     if extra and extra.get("is_enabled"):
         used = extra.get("used_credits")
@@ -239,8 +276,10 @@ def build_output(usage, fetched_at, stale=False):
     lines.append(f"<small>updated {upd}{suffix}</small>")
     tooltip = "\n".join(lines)
 
-    # Worst of session / weekly drives color + percentage.
-    worst = max([p for p in (sp, wp) if p is not None], default=None)
+    # Worst of session / weekly / active model caps drives color + percentage.
+    worst_vals = [p for p in (sp, wp) if p is not None]
+    worst_vals += [m["pct"] for m in models if m["active"] and m["pct"] is not None]
+    worst = max(worst_vals, default=None)
     cls = severity_class(worst)
     if stale:
         cls = cls + " stale"
