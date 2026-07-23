@@ -226,9 +226,11 @@ def build_output(usage, fetched_at, stale=False):
         return "--" if p is None else f"{p:.0f}%"
 
     text = f"{ICON} {n(sp)}·{n(wp)}"
-    # Surface active per-model caps (e.g. Fable) right in the bar, abbreviated.
+    # Surface per-model caps (e.g. Fable) right in the bar, abbreviated.
+    # Don't gate on is_active: the API flips it off once the cap stops being
+    # the binding one (e.g. right after a weekly reset), but we still want it visible.
     for m in models:
-        if m["active"] and m["pct"] is not None:
+        if m["pct"] is not None:
             text += f"·{m['name'][0]}{m['pct']:.0f}%"
     left = time_until(five)
     if left:
@@ -276,9 +278,9 @@ def build_output(usage, fetched_at, stale=False):
     lines.append(f"<small>updated {upd}{suffix}</small>")
     tooltip = "\n".join(lines)
 
-    # Worst of session / weekly / active model caps drives color + percentage.
+    # Worst of session / weekly / per-model caps drives color + percentage.
     worst_vals = [p for p in (sp, wp) if p is not None]
-    worst_vals += [m["pct"] for m in models if m["active"] and m["pct"] is not None]
+    worst_vals += [m["pct"] for m in models if m["pct"] is not None]
     worst = max(worst_vals, default=None)
     cls = severity_class(worst)
     if stale:
