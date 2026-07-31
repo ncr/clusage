@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""clusage-warmup -- make the Claude Code session limit reset at a fixed hour.
+
+Claude Code's rate limits work in 5-hour "session" blocks that start at the top
+of the hour you send your first message in and reset five hours later. To have
+the limit reset at 12:00, the day's first message has to land in the 07:00 hour;
+drift to a first message at 09:40 and the reset slides to 14:00 instead.
+
+This script sends that first message for you: one tiny Haiku request (~170 input
+tokens, no tools, no CLAUDE.md) that opens the block and nothing more. Run it
+from the systemd timer in systemd/ to have the reset land at noon every day.
+
+  clusage-warmup                # honour the guards below (what the timer runs)
+  clusage-warmup --force        # warm up right now, whatever the clock says
+  clusage-warmup --reset-at 14  # aim for a 14:00 reset (hello at 09:00)
+  clusage-warmup --hello-at 8   # say hello at 08:00 whatever that resets to
+
+Guards (both skipped by --force):
+  * only runs during the hello hour, so a timer catch-up after a long sleep
+    doesn't push the reset to some random hour of the evening;
+  * skips if a session block is already running -- the hello would land inside
+    the existing window and change nothing.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from clusage_api import (  # noqa: E402
+    SESSION_HOURS,
+    fetch_usage_retry,
+    read_cache,
+    session_is_active,
+    session_window,
+    write_cache,
+)
+
+DEFAULT_RESET_HOUR = int(os.environ.get("CLUSAGE_RESET_HOUR", "12"))
+DEFAULT_MODEL = os.environ.get("CLUSAGE_WARMUP_MODEL", "haiku")
+
+# --safe-mode drops CLAUDE.md/skills/plugins/hooks/MCP but keeps OAuth auth, and
+# --tools "" sends no tool definitions: the request stays a couple hundred tokens.
+SYSTEM_PROMPT = "You are a warm-up ping. Reply with exactly: ready"
+WAYBAR_SIGNAL = "-RTMIN+11"  # matches "signal": 11 on the custom/clusage module
+
+
+def log(msg):
+    print(f"{datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def notify(summary, body, urgency="low", enabled=True):
+    if not enabled or not shutil.which("notify-send"):
+        return
+    subprocess.run(
+        ["notify-send", "-u", urgency, "-a", "clusage", summary, body],
+        check=False,
+    )
+
+
+def refresh_waybar():
+    """Nudge the clusage bar module so the new window shows up immediately."""
+    if shutil.which("pkill"):
+        subprocess.run(["pkill", WAYBAR_SIGNAL, "waybar"], check=False)
+
+
+def fmt_window(usage):
+    start, end = session_window(usage)
+    if not start:
+        return None
+    return f"{start.strftime('%H:%M')} → {end.strftime('%H:%M')}"
+
+
+def hello_hour(reset_hour):
+    """The hour to say hello in so the block resets at reset_hour."""
+    return (reset_hour - SESSION_HOURS) % 24
+
+
+def expected_window(now=None):
+    """The window a hello sent now opens: this hour, plus five."""
+    now = now or datetime.now()
+    start = now.replace(minute=0, second=0, microsecond=0)
+    end = start + timedelta(hours=SESSION_HOURS)
+    return f"{start.strftime('%H:%M')} → {end.strftime('%H:%M')}"
+
+
+def current_usage(max_cache_age=90):
+    """Usage snapshot, preferring the cache the bar module refreshes every 60s.
+
+    The endpoint 429s under repeated calls, and waybar is already polling it --
+    so on a normal desktop this costs no request at all.
+    """
+    cached = read_cache() or {}
+    if cached.get("usage") and time.time() - (cached.get("fetched_at") or 0) < max_cache_age:
+        return cached["usage"]
+    usage = fetch_usage_retry(attempts=2, delay=5)
+    write_cache(usage)
+    return usage
+
+
+def say_hello(model, timeout=180):
+    """One minimal non-interactive turn. Returns the parsed result envelope."""
+    cmd = [
+        "claude",
+        "-p",
+        "hi",
+        "--model",
+        model,
+        "--safe-mode",
+        "--tools",
+        "",
+        "--system-prompt",
+        SYSTEM_PROMPT,
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=tempfile.gettempdir(),  # neutral cwd: no project settings, no CLAUDE.md
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"claude exited {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:400]}"
+        )
+    return parse_result(proc.stdout)
+
+
+def parse_result(stdout):
+    """--output-format json emits either the result object or a list ending in one."""
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return {}
+    if isinstance(data, list):
+        for msg in reversed(data):
+            if isinstance(msg, dict) and msg.get("type") == "result":
+                return msg
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument(
+        "--reset-at",
+        type=int,
+        default=DEFAULT_RESET_HOUR,
+        metavar="HOUR",
+        help=f"hour the session limit should reset at (default {DEFAULT_RESET_HOUR}"
+        f", i.e. hello at {hello_hour(DEFAULT_RESET_HOUR):02d}:00)",
+    )
+    ap.add_argument(
+        "--hello-at",
+        type=int,
+        default=None,
+        metavar="HOUR",
+        help="say hello at this hour instead of deriving it from --reset-at",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="warm up regardless of the clock or an already-running block",
+    )
+    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"default {DEFAULT_MODEL}")
+    ap.add_argument("--no-notify", action="store_true", help="no desktop notification")
+    args = ap.parse_args()
+    notify_on = not args.no_notify
+    target = args.hello_at if args.hello_at is not None else hello_hour(args.reset_at)
+
+    now = datetime.now()
+    if not args.force and now.hour != target:
+        # Blocks start on the hour, so a catch-up at 07:45 still resets at 12:00
+        # -- but one at 11:00 would push the reset to 16:00. Skip that.
+        log(f"skip: {now.strftime('%H:%M')} is outside the {target:02d}:00 hour")
+        return 0
+
+    usage = None
+    try:
+        usage = current_usage()
+    except Exception as e:
+        # Usually a 429 from the usage endpoint. Warming up is the safe default.
+        log(f"usage check failed ({type(e).__name__}: {e}); warming up anyway")
+
+    running = fmt_window(usage) if usage and session_is_active(usage) else None
+    if running and not args.force:
+        _, end = session_window(usage)
+        # Worth calling out: an early morning session means today's reset is
+        # already fixed somewhere other than where the timer wanted it.
+        off = "" if end.hour == args.reset_at else f", not {args.reset_at:02d}:00"
+        log(f"skip: session block already running ({running}) — resets {end:%H:%M}{off}")
+        notify(
+            "Claude session already warm",
+            f"{running} — resets {end:%H:%M}{off}",
+            enabled=notify_on,
+        )
+        return 0
+
+    log(f"saying hello ({args.model})...")
+    started = time.time()
+    try:
+        result = say_hello(args.model)
+    except Exception as e:
+        log(f"warm-up FAILED: {type(e).__name__}: {e}")
+        notify(
+            "Claude warm-up failed",
+            f"{type(e).__name__}: {e}",
+            urgency="critical",
+            enabled=notify_on,
+        )
+        return 1
+
+    cost = result.get("total_cost_usd")
+    log(
+        "warm-up ok in {:.1f}s{}".format(
+            time.time() - started, f" (${cost:.4f})" if cost is not None else ""
+        )
+    )
+
+    # Re-read usage so the log/notification shows the window we just opened.
+    # If the endpoint is rate-limiting, fall back to what the block must be:
+    # a block we joined mid-flight under --force, else one starting this hour.
+    window, confirmed = running or expected_window(), False
+    try:
+        time.sleep(2)
+        usage = fetch_usage_retry(attempts=3, delay=6)
+        write_cache(usage)
+        window, confirmed = fmt_window(usage) or window, True
+    except Exception as e:
+        log(f"could not confirm window ({type(e).__name__}: {e})")
+
+    log(f"session window: {window}" + ("" if confirmed else " (expected)"))
+    notify("Claude session warmed up", f"Window {window}", enabled=notify_on)
+    refresh_waybar()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+[Unit]
+Description=Say hello to Claude at 07:00 so the session limit resets at 12:00
+
+[Timer]
+# Session blocks last 5h, so a hello at 07:00 makes the limit reset at noon.
+OnCalendar=*-*-* 07:00:00
+AccuracySec=30s
+# Catch up if the timer was missed (machine off, user logged out). The script
+# itself refuses to run outside the 07:00 hour, so a late catch-up is a no-op
+# rather than pushing the reset to the wrong time.
+Persistent=true
+Unit=clusage-warmup.service
+
+[Install]
+WantedBy=timers.target

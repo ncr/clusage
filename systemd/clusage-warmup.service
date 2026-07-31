@@ -1,0 +1,20 @@
+[Unit]
+Description=Warm up Claude Code so the 5h session limit resets at 12:00
+Documentation=file:///home/ncr/dev/clusage/README.md
+# Tie to the graphical session: guarantees network is up, and gives
+# notify-send a desktop to talk to.
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+# Worst case: usage-endpoint backoff + one Claude turn + confirmation backoff.
+TimeoutStartSec=300
+# mise shims + ~/.local/bin for `claude`, /usr/bin for notify-send and pkill.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin
+# The script derives its hello hour from this (reset - 5h) and refuses to run
+# outside it, so OnCalendar= in the timer must agree: 12 -> 07:00.
+Environment=CLUSAGE_RESET_HOUR=12
+ExecStart=%h/.local/bin/clusage-warmup
+# Output goes to the journal: journalctl --user -u clusage-warmup
+StandardOutput=journal
+StandardError=journal
