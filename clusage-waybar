@@ -8,6 +8,10 @@ and prints a Waybar JSON object: {text, tooltip, class, percentage}.
 The bar text shows session (5h) and weekly (all-models) utilization. The tooltip
 adds the per-model weekly breakdown (Sonnet / Opus) and reset times.
 
+With `--panel` the same object carries an extra `panel` key: the limits as data
+(label, percent, reset timestamp) instead of a preformatted tooltip, for the
+Omarchy shell module that draws them as meters in a popup.
+
 Successful responses are cached to ~/.cache/clusage/usage.json so a transient
 network/API failure shows the last known value (dimmed) instead of going blank.
 """
@@ -153,29 +157,120 @@ def build_output(usage, fetched_at, stale=False):
     return out
 
 
+def build_panel(usage, fetched_at, stale=False):
+    """The same limits as the tooltip, as data for the Omarchy shell popup.
+
+    Reset times go out as raw ISO timestamps: the popup counts down against its
+    own clock, so an open panel stays honest between the 60s refreshes.
+    """
+    five = usage.get("five_hour")
+    week = usage.get("seven_day")
+    sonnet = usage.get("seven_day_sonnet")
+    opus = usage.get("seven_day_opus")
+
+    limits = [
+        {
+            "label": "Session",
+            "sublabel": "5h window",
+            "pct": pct(five),
+            "resets_at": (five or {}).get("resets_at"),
+            "kind": "session",
+            "active": False,
+        },
+        {
+            "label": "Weekly",
+            "sublabel": "all models",
+            "pct": pct(week),
+            "resets_at": (week or {}).get("resets_at"),
+            "kind": "weekly",
+            "active": False,
+        },
+    ]
+
+    seen = set()
+    for m in model_limits(usage):
+        limits.append(
+            {
+                "label": m["name"],
+                "sublabel": "weekly cap",
+                "pct": m["pct"],
+                "resets_at": m["resets_at"],
+                "kind": "model",
+                "active": m["active"],
+            }
+        )
+        seen.add(m["name"].lower())
+    for label, blk in (("Sonnet", sonnet), ("Opus", opus)):
+        if blk is not None and label.lower() not in seen:
+            limits.append(
+                {
+                    "label": label,
+                    "sublabel": "weekly cap",
+                    "pct": pct(blk),
+                    "resets_at": blk.get("resets_at"),
+                    "kind": "model",
+                    "active": False,
+                }
+            )
+
+    panel = {
+        "ok": True,
+        "stale": stale,
+        "fetched_at": fetched_at or 0,
+        "updated": time.strftime("%H:%M", time.localtime(fetched_at)) if fetched_at else "",
+        "limits": limits,
+    }
+
+    extra = usage.get("extra_usage")
+    if extra and extra.get("is_enabled"):
+        used = extra.get("used_credits")
+        limit = extra.get("monthly_limit")
+        if used is not None and limit:
+            panel["overage"] = {
+                "used": used,
+                "limit": limit,
+                "currency": extra.get("currency", ""),
+            }
+
+    return panel
+
+
 def main():
+    want_panel = "--panel" in sys.argv[1:]
+
+    def emit(usage, fetched_at, stale=False):
+        out = build_output(usage, fetched_at, stale=stale)
+        if want_panel:
+            out["panel"] = build_panel(usage, fetched_at, stale=stale)
+        print(json.dumps(out))
+
     try:
         token = get_access_token()
         usage = fetch_usage(token)
         write_cache(usage)
-        print(json.dumps(build_output(usage, int(time.time()))))
+        emit(usage, int(time.time()))
         return
     except Exception as e:
         cached = read_cache()
         if cached and cached.get("usage"):
-            out = build_output(cached["usage"], cached.get("fetched_at"), stale=True)
-            print(json.dumps(out))
+            emit(cached["usage"], cached.get("fetched_at"), stale=True)
             return
         # No data at all.
-        print(
-            json.dumps(
-                {
-                    "text": f"{ICON} --",
-                    "tooltip": f"Claude Code usage unavailable\n<small>{type(e).__name__}: {e}</small>",
-                    "class": "unknown error",
-                }
-            )
-        )
+        out = {
+            "text": f"{ICON} --",
+            "tooltip": f"Claude Code usage unavailable\n<small>{type(e).__name__}: {e}</small>",
+            "class": "unknown error",
+        }
+        if want_panel:
+            out["panel"] = {
+                "ok": False,
+                "stale": False,
+                "fetched_at": 0,
+                "updated": "",
+                "limits": [],
+                "error": f"{type(e).__name__}: {e}",
+            }
+        print(json.dumps(out))
 
 
 if __name__ == "__main__":
