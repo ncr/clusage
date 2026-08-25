@@ -1,9 +1,10 @@
-# clusage — Claude Code usage in the Omarchy bar
+# clusage — Claude Code usage in your top bar
 
-Two small tools around the Claude Code rate limits:
+Small tools around the Claude Code rate limits:
 
-- **`clusage-waybar`** — a Waybar module showing live utilization in the top bar.
-- **`clusage-warmup`** — a daily hello that makes the 5h session limit reset at 12:00.
+- **`clusage-waybar`** — a Waybar module (Linux / Omarchy) showing live utilization in the top bar.
+- **`clusage-swiftbar`** — the same indicator for the macOS menu bar, via [SwiftBar](https://github.com/swiftbar/SwiftBar).
+- **`clusage-warmup`** — a daily hello that makes the 5h session limit reset at 12:00 (Linux, systemd timer).
 
 ## clusage-waybar — the indicator
 
@@ -19,29 +20,74 @@ same numbers as the `/usage` panel.
   binding one, and overage-credit usage.
 - Refreshes every 60s. Color shifts amber → red as utilization climbs; dims when stale.
 
+## clusage-swiftbar — the macOS menu bar
+
+[SwiftBar](https://github.com/swiftbar/SwiftBar) is the macOS analog to Waybar —
+it hosts scripts as menu-bar items. `clusage-swiftbar` renders:
+
+- **Menu-bar title:** `◔ {session}% {M}{model}%` — e.g. `◔ 85% F90%`, where the
+  second figure is the Fable weekly limit (`F` = Fable; falls back to the highest
+  per-model limit if Fable isn't active). A plain Unicode glyph is used so it
+  renders without a Nerd Font; weekly-all lives in the dropdown.
+- **Dropdown (click):** every limit — session (with countdown), weekly (all), and each
+  active per-model weekly limit with reset times; a `●` marks the model you're
+  currently constrained by. Plus overage credits (if enabled), a **Refresh** action,
+  and — when the value is stale — the reason the last fetch failed.
+
+### Install
+
+```bash
+./install-macos.sh
+```
+
+This installs SwiftBar (via Homebrew if missing), symlinks the plugin into
+`~/.config/swiftbar/plugins/clusage.60s.py` (the repo stays the source of truth —
+edits take effect on the next refresh), and installs a LaunchAgent
+(`~/Library/LaunchAgents/com.clusage.swiftbar.plist`) so SwiftBar **autostarts at
+login** and the indicator is always in the top bar. Re-run it any time to pick up
+edits. Uninstall with `./uninstall-macos.sh`.
+
+> Alternatively, remove the LaunchAgent and use SwiftBar Preferences → *Launch at
+> Login* for the native login-item mechanism.
+
+If the item vanishes from the bar, check it hasn't been disabled inside SwiftBar
+(`defaults read com.ameba.SwiftBar DisabledPlugins`); re-enable with
+`open -g "swiftbar://enableplugin?name=clusage"`.
+
 ## How it works
 
-`clusage-waybar` reads the OAuth token Claude Code stores in
-`~/.claude/.credentials.json` (`claudeAiOauth`), refreshes it via
-`https://api.anthropic.com/v1/oauth/token` when expired (writing the new token
-back atomically, same as the CLI does), and calls the usage endpoint the
-`/usage` panel uses:
+The scripts read the OAuth token Claude Code stores (`claudeAiOauth`), refresh
+it via `https://api.anthropic.com/v1/oauth/token` when expired (writing the new
+token back to the same place, same as the CLI does), and call the usage endpoint
+the `/usage` panel uses:
 
     GET https://api.anthropic.com/api/oauth/usage   (Bearer token)
+
+Where the token lives:
+
+- **Linux:** `~/.claude/.credentials.json` (`clusage_api.py`).
+- **macOS:** the login Keychain, item `Claude Code-credentials` (account = your
+  username), holding the same JSON blob. Newer CLIs (2.1.x+) moved it there and
+  leave `~/.claude/.credentials.json` as a stub with **empty** tokens, so
+  `clusage-swiftbar` reads the Keychain first (via `/usr/bin/security`, the same
+  tool the CLI uses, so no access prompt) and only falls back to the file if the
+  Keychain has no usable token.
 
 Successful responses are cached to `~/.cache/clusage/usage.json`; if a fetch
 fails, the last value is shown dimmed (class `stale`) instead of going blank.
 
 ### Response notes (undocumented endpoint)
-- `utilization` is **already a percentage** (e.g. `32.0` == 32%), not a 0–1 fraction.
+- `utilization` (and `limits[].percent`) is **already a percentage** (e.g. `32.0` == 32%),
+  not a 0–1 fraction.
 - `resets_at` is an ISO-8601 string, and it **jitters around the hour boundary**
   (`13:00:00.97` one call, `12:59:59.95` the next) — round to the minute or a
   15:00 reset renders as `14:59`.
 - Blocks can be `null` (e.g. `seven_day_opus` when Opus is unused this week).
 - **Per-model weekly caps moved into `limits[]`**: the old `seven_day_<model>` fields
-  are now `null`; each model cap is a `weekly_scoped` entry carrying
-  `scope.model.display_name` (e.g. `Fable`), a `percent`, and `is_active` marking the
-  currently binding limit.
+  are now `null`; each entry is `{kind, percent, resets_at, scope, is_active}` with
+  `kind` one of `session`, `weekly_all`, or `weekly_scoped` — the latter carries
+  `scope.model.display_name` (e.g. `Fable`) and `is_active` marks the currently
+  binding limit.
 
 ## clusage-warmup — make the session limit reset at 12:00
 
@@ -89,6 +135,8 @@ reset hour (minus 5) and refuses to run outside it, so the two must agree
 
 ## Installed files
 
+**Linux (Waybar + warm-up)**
+
 | File | Purpose |
 |------|---------|
 | `~/dev/clusage/clusage_api.py` | shared OAuth + usage-endpoint access |
@@ -111,6 +159,15 @@ systemctl --user link ~/dev/clusage/systemd/clusage-warmup.{service,timer}
 systemctl --user enable --now clusage-warmup.timer
 ```
 
+**macOS (SwiftBar)**
+
+| File | Purpose |
+|------|---------|
+| `~/dev/clusage/clusage-swiftbar` | the plugin (source of truth; self-contained, Keychain-aware copy of the core) |
+| `~/.config/swiftbar/plugins/clusage.60s.py` | symlink SwiftBar runs every 60s |
+| `~/Library/LaunchAgents/com.clusage.swiftbar.plist` | autostart SwiftBar at login |
+| `~/.cache/clusage/usage.json` | last successful response |
+
 ## Caveats
 
 - Uses the CLI's own undocumented OAuth endpoint — Anthropic could change it.
@@ -122,12 +179,15 @@ systemctl --user enable --now clusage-warmup.timer
   real message lands.
 - The 07:00–12:00 block is sacrificial by design: morning usage goes into it and
   a fresh limit is waiting at noon.
-- The script can refresh the OAuth token and rewrite `~/.claude/.credentials.json`.
-  Because refresh tokens rotate, the new token is written back to the same file
-  Claude Code reads, so the CLI picks it up on next use. It only refreshes when
-  the token is within 60s of expiry (or on a 401).
+- The scripts can refresh the OAuth token and rewrite the credential store
+  (`~/.claude/.credentials.json` on Linux, the `Claude Code-credentials` Keychain
+  item on macOS). Because refresh tokens rotate, the new token is written back to
+  the same place Claude Code reads, so the CLI picks it up on next use. It only
+  refreshes when the token is within 60s of expiry (or on a 401).
 
 ## Remove
+
+**Linux**
 
 ```bash
 systemctl --user disable --now clusage-warmup.timer
@@ -138,4 +198,11 @@ rm -rf ~/.cache/clusage
 # then delete the custom/clusage module + modules-right entry from
 # ~/.config/waybar/config.jsonc and the #custom-clusage rules from style.css
 omarchy restart waybar
+```
+
+**macOS**
+
+```bash
+./uninstall-macos.sh            # removes the plugin, LaunchAgent, and cache
+brew uninstall --cask swiftbar  # optional: remove SwiftBar itself
 ```

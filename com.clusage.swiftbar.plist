@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Autostarts SwiftBar (which hosts the clusage plugin) at login.
+         `open -gja SwiftBar` launches it in the background/hidden; the menu-bar
+         icon still appears. Installed to ~/Library/LaunchAgents by install-macos.sh. -->
+    <key>Label</key>
+    <string>com.clusage.swiftbar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-gja</string>
+        <string>SwiftBar</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>

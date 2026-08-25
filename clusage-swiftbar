@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""clusage-swiftbar -- Claude Code usage indicator for the macOS menu bar (SwiftBar).
+
+The macOS counterpart to `clusage-waybar`. Reads the OAuth token Claude Code
+stores in the login Keychain (service "Claude Code-credentials"; newer CLIs no
+longer keep it in ~/.claude/.credentials.json, which is left as a stub with
+empty tokens), falls back to that JSON file, calls the same usage endpoint the
+`/usage` panel uses (api.anthropic.com/api/oauth/usage), and prints SwiftBar
+plugin output.
+
+Menu-bar title: session (5h) and weekly (all-models) utilization plus the worst
+per-model weekly limit (e.g. Fable). The dropdown lists every limit with reset
+times, and clicking "Refresh" re-runs the plugin.
+
+Successful responses are cached to ~/.cache/clusage/usage.json so a transient
+network/API failure shows the last known value (dimmed) instead of going blank.
+
+SwiftBar reads the refresh interval from the plugin filename, so this file is
+installed as `clusage.60s.py` (refresh every 60 seconds).
+
+  # <bitbar.title>Claude Code Usage</bitbar.title>
+  # <bitbar.version>1.0</bitbar.version>
+  # <bitbar.author>clusage</bitbar.author>
+  # <bitbar.desc>Live Claude Code rate-limit utilization (session/weekly/per-model).</bitbar.desc>
+  # <bitbar.dependencies>python3</bitbar.dependencies>
+  # <swiftbar.hideAbout>true</swiftbar.hideAbout>
+  # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
+  # <swiftbar.hideSwiftBar>false</swiftbar.hideSwiftBar>
+"""
+
+import getpass
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime
+
+CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+# macOS: Claude Code keeps the OAuth blob (same JSON as the file) in the login
+# Keychain under this service, keyed by the local username. It reads/writes it
+# via the `security` CLI, so we do the same and stay ACL-compatible.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_ACCOUNT = getpass.getuser()
+CACHE_DIR = os.path.expanduser("~/.cache/clusage")
+CACHE_PATH = os.path.join(CACHE_DIR, "usage.json")
+
+API_BASE = "https://api.anthropic.com"
+USAGE_URL = f"{API_BASE}/api/oauth/usage"
+TOKEN_URL = f"{API_BASE}/v1/oauth/token"
+# Public Claude Code OAuth client id (same one the CLI ships).
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+UA = "clusage-swiftbar/1.0"
+# Monochrome gauge glyph rendered as menu-bar text, so it inherits the white text
+# color (no Nerd Font needed, and unlike SF Symbols it reliably renders in the title).
+ICON = "◔"  # ◔
+
+WHITE = "#ffffff"
+GRAY = "#8e8e93"  # dimmed secondary text (header/footer) and the stale state
+
+
+def _http_json(req, timeout=8):
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+class NotLoggedIn(Exception):
+    """No usable Claude Code OAuth credentials in the Keychain or the JSON file."""
+
+
+def _has_tokens(creds):
+    oauth = (creds or {}).get("claudeAiOauth") or {}
+    return bool(oauth.get("accessToken") or oauth.get("refreshToken"))
+
+
+def _security(*args):
+    return subprocess.run(
+        ["/usr/bin/security", *args],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout
+
+
+def _keychain_read():
+    """Parsed credentials blob from the login Keychain, or None if absent/unusable."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = _security(
+            "find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE, "-w"
+        )
+        return json.loads(out.strip())
+    except Exception:
+        return None
+
+
+def _keychain_write(data):
+    # `-U` updates the existing item in place (keeps its ACL, so Claude Code keeps
+    # reading it without a prompt). Same call the CLI itself makes.
+    _security(
+        "add-generic-password",
+        "-U",
+        "-a",
+        KEYCHAIN_ACCOUNT,
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-w",
+        json.dumps(data),
+    )
+
+
+def _file_read():
+    try:
+        with open(CREDS_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def _file_write(data):
+    """Atomically write credentials back, preserving permissions (0600)."""
+    tmp = CREDS_PATH + ".clusage.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        finally:
+            raise
+    os.replace(tmp, CREDS_PATH)
+
+
+def load_creds():
+    """Return (creds, store). Keychain first (macOS), then the JSON file.
+
+    The store tag is passed back to save_creds() so a refreshed token lands in
+    the same place Claude Code will look for it.
+    """
+    creds = _keychain_read()
+    if _has_tokens(creds):
+        return creds, "keychain"
+    creds = _file_read()
+    if _has_tokens(creds):
+        return creds, "file"
+    raise NotLoggedIn(
+        "no OAuth token in Keychain or ~/.claude/.credentials.json -- run `claude` and log in"
+    )
+
+
+def save_creds(data, store):
+    if store == "keychain":
+        _keychain_write(data)
+    else:
+        _file_write(data)
+
+
+def refresh_token(creds, store):
+    """Refresh the access token in place and persist it. Returns new access token."""
+    oauth = creds["claudeAiOauth"]
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": oauth["refreshToken"],
+            "client_id": CLIENT_ID,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    tok = _http_json(req)
+    oauth["accessToken"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        oauth["refreshToken"] = tok["refresh_token"]
+    if tok.get("expires_in"):
+        oauth["expiresAt"] = int(time.time() * 1000) + int(tok["expires_in"]) * 1000
+    save_creds(creds, store)
+    return oauth["accessToken"]
+
+
+def get_access_token():
+    creds, store = load_creds()
+    oauth = creds["claudeAiOauth"]
+    expires_at = oauth.get("expiresAt") or 0
+    # Refresh if expired or within 60s of expiry.
+    if time.time() * 1000 >= expires_at - 60_000:
+        return refresh_token(creds, store)
+    return oauth["accessToken"]
+
+
+def fetch_usage(token, allow_refresh=True):
+    req = urllib.request.Request(
+        USAGE_URL,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    try:
+        return _http_json(req)
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and allow_refresh:
+            # Token rejected -> force a refresh and retry once.
+            creds, store = load_creds()
+            token = refresh_token(creds, store)
+            return fetch_usage(token, allow_refresh=False)
+        raise
+
+
+def write_cache(usage):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    payload = {"fetched_at": int(time.time()), "usage": usage}
+    tmp = CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, CACHE_PATH)
+
+
+def read_cache():
+    try:
+        with open(CACHE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# --- usage -> normalized limits -------------------------------------------------
+#
+# The endpoint's modern shape is a `limits` array of {kind, percent, resets_at,
+# scope}. Per-model weekly limits (Sonnet / Opus / Fable / ...) arrive as
+# kind="weekly_scoped" with scope.model.display_name -- that is what surfaces
+# Fable. The legacy top-level blocks (five_hour, seven_day, seven_day_sonnet,
+# seven_day_opus) are kept as a fallback for older API responses.
+
+
+def _entry(label, percent, resets_at, active=False):
+    return {
+        "label": label,
+        "percent": percent,
+        "resets_at": resets_at,
+        "active": active,
+    }
+
+
+def collect(usage):
+    """Return (session, weekly, [scoped...]) normalized entries; any may be None/[]."""
+    session = weekly = None
+    scoped = []
+
+    for lim in usage.get("limits") or []:
+        kind = lim.get("kind")
+        pct = lim.get("percent")
+        resets = lim.get("resets_at")
+        if kind == "session":
+            session = _entry("Session (5h)", pct, resets)
+        elif kind == "weekly_all":
+            weekly = _entry("Weekly (all)", pct, resets)
+        elif kind == "weekly_scoped":
+            model = (lim.get("scope") or {}).get("model") or {}
+            name = model.get("display_name") or "Model"
+            scoped.append(_entry(name, pct, resets, active=bool(lim.get("is_active"))))
+
+    # Fallback to legacy top-level blocks if `limits` was absent/empty.
+    if session is None and usage.get("five_hour"):
+        b = usage["five_hour"]
+        session = _entry("Session (5h)", b.get("utilization"), b.get("resets_at"))
+    if weekly is None and usage.get("seven_day"):
+        b = usage["seven_day"]
+        weekly = _entry("Weekly (all)", b.get("utilization"), b.get("resets_at"))
+    if not scoped:
+        for key, name in (("seven_day_sonnet", "Sonnet"), ("seven_day_opus", "Opus")):
+            b = usage.get(key)
+            if b:
+                scoped.append(_entry(name, b.get("utilization"), b.get("resets_at")))
+
+    return session, weekly, scoped
+
+
+# --- formatting -----------------------------------------------------------------
+
+
+def fmt_pct(p, width=0):
+    if p is None:
+        return f"{'--':>{width}}" if width else "--"
+    s = f"{p:.0f}%"
+    return f"{s:>{width}}" if width else s
+
+
+def fmt_reset(resets_at, weekly=False):
+    if not resets_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(resets_at).astimezone()
+    except Exception:
+        return ""
+    return dt.strftime("%a %H:%M") if weekly else dt.strftime("%H:%M")
+
+
+def time_until(resets_at):
+    """Compact countdown, e.g. '2h18m', '47m', 'now'."""
+    if not resets_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(resets_at).astimezone()
+    except Exception:
+        return ""
+    secs = int(dt.timestamp() - time.time())
+    if secs <= 0:
+        return "now"
+    h, m = divmod(secs // 60, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+# --- SwiftBar output ------------------------------------------------------------
+
+
+def sb_line(text, **params):
+    """One SwiftBar menu line: `text | k=v k=v`. None-valued params are dropped."""
+    parts = [text]
+    for k, v in params.items():
+        if v is None:
+            continue
+        parts.append(f"{k}={v}")
+    return " | ".join(parts) if len(parts) > 1 else text
+
+
+def emit(lines):
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
+def describe_error(e):
+    """Short human-readable reason for a failed fetch (shown in the dropdown)."""
+    if isinstance(e, NotLoggedIn):
+        return f"Not logged in: {e}"
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code} from {e.url.split('/api/')[-1] if e.url else 'API'}"
+    return f"{type(e).__name__}: {e}"
+
+
+def build_lines(usage, fetched_at, stale=False, error=None):
+    session, weekly, scoped = collect(usage)
+    sp = session["percent"] if session else None
+    wp = weekly["percent"] if weekly else None
+
+    # The bar shows two figures: session (5h) and the Fable weekly limit.
+    # Prefer the Fable-scoped entry; fall back to the highest per-model limit if
+    # Fable isn't present this week (weekly-all still appears in the dropdown).
+    top = None
+    if scoped:
+        fable = [s for s in scoped if (s["label"] or "").lower() == "fable"]
+        pool = fable or scoped
+        top = max(pool, key=lambda s: (s["percent"] if s["percent"] is not None else -1))
+
+    title_txt = f"{ICON} {fmt_pct(sp)}"
+    if top:
+        title_txt += f" {top['label'][0].upper()}{fmt_pct(top['percent'])}"
+
+    tint = GRAY if stale else WHITE
+    lines = [sb_line(title_txt, color=tint)]
+    lines.append("---")
+    lines.append(sb_line("Claude Code usage", color=GRAY, size=13))
+
+    rows = []
+    if session:
+        rows.append((session, False))
+    if weekly:
+        rows.append((weekly, True))
+    for s in scoped:
+        rows.append((s, True))
+
+    for entry, is_weekly in rows:
+        p = entry["percent"]
+        label = entry["label"]
+        reset = fmt_reset(entry["resets_at"], weekly=is_weekly)
+        if not is_weekly:
+            # Session: show a live countdown alongside the wall-clock reset.
+            left = time_until(entry["resets_at"])
+            reset = f"{left} ({reset})" if left and reset else (reset or left)
+        marker = "● " if entry.get("active") else "  "
+        text = f"{marker}{label:<13}{fmt_pct(p, 4)}   {reset}"
+        lines.append(sb_line(text, font="Menlo", size=13))
+
+    # Overage / extra-usage credits, if enabled.
+    extra = usage.get("extra_usage")
+    if extra and extra.get("is_enabled"):
+        used = extra.get("used_credits")
+        limit = extra.get("monthly_limit")
+        cur = extra.get("currency", "")
+        if used is not None and limit:
+            lines.append("---")
+            lines.append(
+                sb_line(
+                    f"Overage {used:.0f}/{limit:.0f} {cur} credits",
+                    font="Menlo",
+                    size=12,
+                )
+            )
+
+    lines.append("---")
+    lines.append(sb_line("Refresh", refresh="true", sfimage="arrow.clockwise"))
+    upd = time.strftime("%H:%M", time.localtime(fetched_at)) if fetched_at else "?"
+    suffix = "  (stale)" if stale else ""
+    lines.append(sb_line(f"Updated {upd}{suffix}", color=GRAY, size=12))
+    if error:
+        lines.append(sb_line(describe_error(error), font="Menlo", size=11, color=GRAY))
+    return lines
+
+
+def main():
+    try:
+        token = get_access_token()
+        usage = fetch_usage(token)
+        write_cache(usage)
+        emit(build_lines(usage, int(time.time())))
+        return
+    except Exception as e:
+        cached = read_cache()
+        if cached and cached.get("usage"):
+            emit(build_lines(cached["usage"], cached.get("fetched_at"), stale=True, error=e))
+            return
+        # No data at all.
+        emit(
+            [
+                sb_line(f"{ICON} --", color=GRAY),
+                "---",
+                sb_line("Claude Code usage unavailable", color=GRAY, size=13),
+                sb_line(describe_error(e), font="Menlo", size=12, color=GRAY),
+                "---",
+                sb_line("Refresh", refresh="true", sfimage="arrow.clockwise"),
+            ]
+        )
+
+
+if __name__ == "__main__":
+    main()
