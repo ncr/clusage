@@ -34,7 +34,7 @@ Install it by symlinking the directory into the plugins directory, then add
 `{"id": "io.github.ncr.clusage"}` to a bar section in `~/.config/omarchy/shell.json`:
 
 ```bash
-ln -s ~/dev/clusage/shell/io.github.ncr.clusage ~/.config/omarchy/plugins/io.github.ncr.clusage
+ln -s ~/dev/omarchy-clusage/shell/io.github.ncr.clusage ~/.config/omarchy/plugins/io.github.ncr.clusage
 omarchy restart shell
 ```
 
@@ -160,11 +160,11 @@ reset hour (minus 5) and refuses to run outside it, so the two must agree
 
 | File | Purpose |
 |------|---------|
-| `~/dev/clusage/clusage_api.py` | shared OAuth + usage-endpoint access |
-| `~/dev/clusage/clusage-waybar` | fetches the numbers; `--panel` feeds the plugin |
-| `~/dev/clusage/shell/io.github.ncr.clusage/` | the Omarchy bar widget (symlinked into `~/.config/omarchy/plugins/`) |
-| `~/dev/clusage/clusage-warmup` | the daily session warm-up |
-| `~/dev/clusage/systemd/clusage-warmup.{service,timer}` | 07:00 daily timer (⇒ 12:00 reset) |
+| `~/dev/omarchy-clusage/clusage_api.py` | shared OAuth + usage-endpoint access |
+| `~/dev/omarchy-clusage/clusage-waybar` | fetches the numbers; `--panel` feeds the plugin |
+| `~/dev/omarchy-clusage/shell/io.github.ncr.clusage/` | the Omarchy bar widget (symlinked into `~/.config/omarchy/plugins/`) |
+| `~/dev/omarchy-clusage/clusage-warmup` | the daily session warm-up |
+| `~/dev/omarchy-clusage/systemd/clusage-warmup.{service,timer}` | 07:00 daily timer (⇒ 12:00 reset) |
 | `~/.local/bin/clusage-{waybar,warmup}` | symlinks onto `PATH` |
 | `~/.config/systemd/user/clusage-warmup.{service,timer}` | symlinks (`systemctl --user link`) |
 | `~/.config/omarchy/shell.json` | the `io.github.ncr.clusage` entry in a bar section |
@@ -175,8 +175,8 @@ Click the pill to open the panel; it refetches only when the last fetch is older
 Install the timer with:
 
 ```bash
-ln -sfn ~/dev/clusage/clusage-warmup ~/.local/bin/clusage-warmup
-systemctl --user link ~/dev/clusage/systemd/clusage-warmup.{service,timer}
+ln -sfn ~/dev/omarchy-clusage/clusage-warmup ~/.local/bin/clusage-warmup
+systemctl --user link ~/dev/omarchy-clusage/systemd/clusage-warmup.{service,timer}
 systemctl --user enable --now clusage-warmup.timer
 ```
 
@@ -184,7 +184,7 @@ systemctl --user enable --now clusage-warmup.timer
 
 | File | Purpose |
 |------|---------|
-| `~/dev/clusage/clusage-swiftbar` | the plugin (source of truth; self-contained, Keychain-aware copy of the core) |
+| `~/dev/omarchy-clusage/clusage-swiftbar` | the plugin (source of truth; self-contained, Keychain-aware copy of the core) |
 | `~/.config/swiftbar/plugins/clusage.60s.py` | symlink SwiftBar runs every 60s |
 | `~/Library/LaunchAgents/com.clusage.swiftbar.plist` | autostart SwiftBar at login |
 | `~/.cache/clusage/usage.json` | last successful response |

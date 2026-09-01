@@ -1,6 +1,6 @@
 [Unit]
 Description=Warm up Claude Code so the 5h session limit resets at 12:00
-Documentation=file:///home/ncr/dev/clusage/README.md
+Documentation=file:///home/ncr/dev/omarchy-clusage/README.md
 # Tie to the graphical session: guarantees network is up, and gives
 # notify-send a desktop to talk to.
 After=graphical-session.target
