@@ -2,8 +2,11 @@
 
 Small tools around the Claude Code rate limits:
 
-- **`clusage-waybar`** — a Waybar module (Linux / Omarchy) showing live utilization in the top bar.
+- **`shell/io.github.ncr.clusage`** — an Omarchy shell plugin: the pill in the bar,
+  and a panel with every limit when you click it.
 - **`clusage-swiftbar`** — the same indicator for the macOS menu bar, via [SwiftBar](https://github.com/swiftbar/SwiftBar).
+- **`clusage-waybar`** — the script behind both. `--panel` prints the bar text and the
+  limits as one JSON object; without it, the older Waybar module format.
 - **`clusage-warmup`** — a daily hello that makes the 5h session limit reset at 12:00 (Linux, systemd timer).
 
 ## clusage-waybar — the indicator
@@ -19,6 +22,24 @@ same numbers as the `/usage` panel.
   (Fable, and Sonnet/Opus if the API still reports them) with `◀` marking the currently
   binding one, and overage-credit usage.
 - Refreshes every 60s. Color shifts amber → red as utilization climbs; dims when stale.
+
+## The Omarchy plugin
+
+`shell/io.github.ncr.clusage/` is a bar widget for the Omarchy shell (Quickshell),
+not for Waybar. `Panel.qml` calls `clusage-waybar --panel` once per refresh and
+draws both the pill and the panel from that one answer, so opening the panel costs
+no extra request — the endpoint returns 429 readily.
+
+Install it by symlinking the directory into the plugins directory, then add
+`{"id": "io.github.ncr.clusage"}` to a bar section in `~/.config/omarchy/shell.json`:
+
+```bash
+ln -s ~/dev/clusage/shell/io.github.ncr.clusage ~/.config/omarchy/plugins/io.github.ncr.clusage
+omarchy restart shell
+```
+
+Two settings live in the `shell.json` entry: `refreshIntervalSec` (default 60, floor 15)
+and `command` (path to `clusage-waybar`).
 
 ## clusage-swiftbar — the macOS menu bar
 
@@ -135,21 +156,21 @@ reset hour (minus 5) and refuses to run outside it, so the two must agree
 
 ## Installed files
 
-**Linux (Waybar + warm-up)**
+**Linux (Omarchy shell + warm-up)**
 
 | File | Purpose |
 |------|---------|
 | `~/dev/clusage/clusage_api.py` | shared OAuth + usage-endpoint access |
-| `~/dev/clusage/clusage-waybar` | the bar module (source of truth) |
+| `~/dev/clusage/clusage-waybar` | fetches the numbers; `--panel` feeds the plugin |
+| `~/dev/clusage/shell/io.github.ncr.clusage/` | the Omarchy bar widget (symlinked into `~/.config/omarchy/plugins/`) |
 | `~/dev/clusage/clusage-warmup` | the daily session warm-up |
 | `~/dev/clusage/systemd/clusage-warmup.{service,timer}` | 07:00 daily timer (⇒ 12:00 reset) |
 | `~/.local/bin/clusage-{waybar,warmup}` | symlinks onto `PATH` |
 | `~/.config/systemd/user/clusage-warmup.{service,timer}` | symlinks (`systemctl --user link`) |
-| `~/.config/waybar/config.jsonc` | `custom/clusage` module + `modules-right` entry |
-| `~/.config/waybar/style.css` | `#custom-clusage` spacing + severity colors |
+| `~/.config/omarchy/shell.json` | the `io.github.ncr.clusage` entry in a bar section |
 | `~/.cache/clusage/usage.json` | last successful response |
 
-Click the module to force a refresh; right-click for a notification with the full breakdown.
+Click the pill to open the panel; it refetches only when the last fetch is older than 30 s.
 
 Install the timer with:
 
@@ -195,9 +216,9 @@ rm ~/.config/systemd/user/clusage-warmup.{service,timer}
 systemctl --user daemon-reload
 rm ~/.local/bin/clusage-{waybar,warmup}
 rm -rf ~/.cache/clusage
-# then delete the custom/clusage module + modules-right entry from
-# ~/.config/waybar/config.jsonc and the #custom-clusage rules from style.css
-omarchy restart waybar
+rm ~/.config/omarchy/plugins/io.github.ncr.clusage
+# then delete the io.github.ncr.clusage entry from ~/.config/omarchy/shell.json
+omarchy restart shell
 ```
 
 **macOS**

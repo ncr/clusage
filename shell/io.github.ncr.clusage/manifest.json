@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ncr.clusage",
+  "name": "Clusage",
+  "version": "0.1.0",
+  "author": "Jacek Becela",
+  "license": "MIT",
+  "description": "Zużycie limitu Claude Code na pasku Omarchy: pigułka z procentami, a po kliknięciu panel z każdym limitem i czasem do resetu.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Clusage",
+    "description": "Procent wykorzystania limitu Claude Code, czerwony po przekroczeniu progu. Panel pokazuje każdy limit z paskiem i odliczaniem do resetu.",
+    "category": "Development",
+    "aliases": [
+      "clusage",
+      "claude",
+      "usage",
+      "limit"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "command": "~/.local/bin/clusage-waybar"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Co ile odświeżać (sekundy)",
+        "min": 15,
+        "max": 600,
+        "step": 15,
+        "defaultValue": 60,
+        "description": "Endpoint zwraca 429 przy częstym odpytywaniu, więc poniżej 15 s i tak nie zejdzie."
+      },
+      {
+        "key": "command",
+        "type": "string",
+        "label": "Ścieżka do clusage-waybar",
+        "defaultValue": "~/.local/bin/clusage-waybar",
+        "description": "Skrypt wołany z --panel; wypisuje tekst paska i limity jako jeden obiekt JSON."
+      }
+    ]
+  }
+}
